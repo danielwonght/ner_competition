@@ -1,14 +1,20 @@
 import pytorch_lightning as pl
-from transformers import AutoModel, AutoTokenizer
+from transformers import AutoModel, AutoTokenizer, BertTokenizer
 from typing import Union, List
 from torch.utils.data import Dataset, DataLoader
 from transformers import get_linear_schedule_with_warmup, AdamW
-from .models.bert_for_ner import BertCrfForNer, BertSoftmaxForNer, ElectraCrfForNer
+from .models.bert_for_ner import BertCrfForNer, BertSoftmaxForNer, ElectraCrfForNer, BartCrfForNer, RoformerCrfForNer
 from .feature_converter import FeatureConverter
-from pytorch_lightning.callbacks import ModelCheckpoint, EarlyStopping
+from pytorch_lightning.callbacks import ModelCheckpoint, EarlyStopping, Callback
 from .utils import collate_fn
+from .attacks.pgd import PGD
 import torch
-import numpy as np
+from pytorch_lightning import seed_everything
+
+# Sets seed
+seed = 42
+seed_everything(seed)
+
 
 class DictDataset(Dataset):
     def __init__(self, inputs):
@@ -62,7 +68,7 @@ class plNERDataset(pl.LightningDataModule):
 
 
 class plNERModel(pl.LightningModule):
-    def __init__(self, config, model, feature_converter:FeatureConverter):
+    def __init__(self, config, model, feature_converter:FeatureConverter, use_attack=True):
         super().__init__()
         self.config = config
         self.pretrained_path = config.pretrained_path
@@ -70,6 +76,9 @@ class plNERModel(pl.LightningModule):
         self._device = config.device
         self.feature_converter = feature_converter
         self.markup = self.config.markup
+        self.use_attack = use_attack
+        if self.use_attack:
+            self.pgd = PGD(self.model)
 
     def forward(self, batch):
         return self.model(**batch)
@@ -78,12 +87,43 @@ class plNERModel(pl.LightningModule):
         return self.model.decode(input_ids, token_type_ids, attention_mask, logits)
     
     def training_step(self, batch, batch_idx=None, optimizer_idx=None):
-        input_lens = batch.pop("length", None)
+        batch.pop("length", None)  # Discards redundant key
         inputs = {k: v.to(self._device) for k, v in batch.items()}
         outputs = self(inputs)
         loss = outputs[0].mean()
-        self.log('train_loss', loss, on_step=True, on_epoch=True, prog_bar=True, logger=True)
-        return {'loss': loss}
+        
+        if not self.automatic_optimization:
+            optimizer = self.optimizers(use_pl_optimizer=False)
+            scheduler = self.lr_schedulers()
+            self.manual_backward(loss)  # 反向传播，得到正常的grad
+            
+            # 梯度下降，更新参数
+            optimizer.step()
+            scheduler.step()
+            optimizer.zero_grad()
+            self.log('train_loss', loss, on_step=True, on_epoch=True, prog_bar=True, logger=True)
+        else:
+            self.log('train_loss', loss, on_step=True, on_epoch=True, prog_bar=True, logger=True)
+            return {'loss': loss}
+    
+    def optimizer_step(self, epoch, batch_idx, optimizer, optimizer_idx,
+                   optimizer_closure, on_tpu, using_native_amp, using_lbfgs):
+        if not self.use_attack:
+            optimizer.step(closure=optimizer_closure)
+        else:
+            optimizer_closure()
+            # 对抗训练
+            K = 3
+            self.pgd.backup_grad()
+            for t in range(K):
+                self.pgd.attack(epsilon=0.5, alpha=0.3, is_first_attack=(t==0))  # 在embedding上添加对抗扰动, first attack时备份param.data
+                if t != K-1:
+                    optimizer.zero_grad()
+                else:
+                    self.pgd.restore_grad()
+                optimizer_closure()
+            self.pgd.restore()  # 恢复embedding参数
+            optimizer.step()
 
     def validation_step(self, batch, batch_idx=None, optimizer_idx=None):
         input_lens = batch.pop("length", None)
@@ -116,6 +156,12 @@ class plNERModel(pl.LightningModule):
         self.log('precision', precision, on_step=False, on_epoch=True, prog_bar=True, logger=True)
         self.log('f1', f1, on_step=False, on_epoch=True, prog_bar=True, logger=True)
         tensorboard_logs = {"recall": recall, "precision":precision, "f1":f1, "class_info":class_info}
+        # print("***** Entity results %s *****")
+        # for key in sorted(class_info.keys()):
+        #     # print("******* %s results ********" % key)
+        #     info = "-".join([f' {key}: {value:.4f} ' for key, value in class_info[key].items()])
+        #     info = " ".join([key] + [f"{value:.4f}" for key, value in class_info[key].items()])
+        #     print(info)
         return {'val_loss': avg_loss, 'log': tensorboard_logs}
     
     def configure_optimizers(self):
@@ -165,23 +211,54 @@ class plNERModel(pl.LightningModule):
         model = train_model[model_type].from_pretrained(pretrained_path)
         feature_converter = FeatureConverter.from_pretrained(pretrained_path)
         return cls(config, model, feature_converter)
-        
-train_model = {"BertSoftmaxForNer":BertSoftmaxForNer,"BertCrfForNer":BertCrfForNer,"ElectraCrfForNer":ElectraCrfForNer}
 
-def train(train_data, val_data, config, label2id, id2label, gpus=[1]):
+
+class PrintCallback(Callback):
+    def on_train_start(self, trainer, pl_module):
+        print("Training is started!")
+    
+    def on_train_end(self, trainer, pl_module):
+        print("Training is done.")
+    
+    def on_validation_end(self, trainer, pl_module):
+        print("Validation is done.")
+
+
+train_model = {
+    "BertSoftmaxForNer": BertSoftmaxForNer,
+    "BertCrfForNer": BertCrfForNer,
+    "ElectraCrfForNer": ElectraCrfForNer,
+    "BartCrfForNer": BartCrfForNer,
+    "RoformerCrfForNer": RoformerCrfForNer,
+}
+
+def train(train_data, val_data, config, label2id, id2label, gpus=[1], use_attack=False):
     import os
     os.environ["TOKENIZERS_PARALLELISM"] = "true"
     config.update(train_samples = len(train_data), num_labels=len(label2id))
     model_type = config.model_type
     pretrained_path = config.pretrained_path
     tokenizer = AutoTokenizer.from_pretrained(pretrained_path)
+    # tokenizer = BertTokenizer.from_pretrained(pretrained_path)
     model = train_model[model_type].from_pretrained(pretrained_path, num_labels=config.num_labels)
+    if model_type == "RoformerCrfForNer":
+        model.reload(pretrained_path)
     feature_converter = FeatureConverter(config, tokenizer, label2id, id2label)
     pl_dataset = plNERDataset(config, train_data, val_data, feature_converter=feature_converter)
-    pl_model = plNERModel(config, model, feature_converter=feature_converter).to(config.device)
+    pl_model = plNERModel(config, 
+                          model, 
+                          feature_converter=feature_converter, 
+                          use_attack=use_attack).to(config.device)
     checkpoint_callback = ModelCheckpoint(monitor='f1', mode='max')
-    earlystopping_callback = EarlyStopping(monitor='f1', patience=1, check_on_train_epoch_end=False, mode="max")
-    trainer = pl.Trainer(max_epochs=config.num_epochs, gpus=gpus, callbacks=[checkpoint_callback, earlystopping_callback], gradient_clip_val=1, accumulate_grad_batches=4)
+    earlystopping_callback = EarlyStopping(monitor='f1', patience=2, check_on_train_epoch_end=False, mode="max")
+    print_callback = PrintCallback()
+    trainer = pl.Trainer(max_epochs=config.num_epochs, 
+                         gpus=gpus, 
+                         callbacks=[print_callback, checkpoint_callback, earlystopping_callback], 
+                         enable_checkpointing=True,
+                         gradient_clip_val=1, 
+                        #  accumulate_grad_batches=4,
+                        )
     trainer.fit(pl_model, pl_dataset)
     ckpt = torch.load(checkpoint_callback.best_model_path)
     pl_model.load_state_dict(ckpt["state_dict"])
@@ -216,4 +293,3 @@ def predict(data, config, device=None):
     for i, example in enumerate(data):
         example["labels"] = all_tags[i]
     return data
-

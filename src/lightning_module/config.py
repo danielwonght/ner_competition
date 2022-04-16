@@ -1,4 +1,5 @@
 import os
+
 import json
 import torch
 
@@ -13,9 +14,9 @@ class Config:
         self.crf_learning_rate = 3e-3
         self.eps = 1e-10
         self.max_length = 128
-        self.model_type = "BertCrfForNer"
-        self.pretrained_path = "checkpoints/bert_large/"
-        self.model_ckpt_path = "checkpoints/outputs/ner_bert/"
+        self.model_type = "RoformerCrfForNer"
+        self.pretrained_path = "/opt/wekj/danniu_huawei_cloud/scratch/checkpoint/roformer_ner"
+        self.model_ckpt_path = "/opt/wekj/danniu_huawei_cloud/ner_competition/checkpoints/tmp_focal_roformer_pretrained_attack"
         self.markup = 'bio'
         self.weight_decay = 0.01
         self.num_workers = 4
